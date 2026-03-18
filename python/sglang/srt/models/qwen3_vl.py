@@ -37,7 +37,6 @@ from sglang.srt.layers.attention.vision import (
     FLASHINFER_WORKSPACE_SIZE_BYTES,
     VisionAttention,
 )
-from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -75,6 +74,7 @@ from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_int_env_var, is_npu, round_up
 from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.layers.conv import Conv3dLayer
 
 _is_npu = is_npu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
@@ -1326,6 +1326,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
@@ -1333,6 +1337,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     hidden_states,
                     self.lm_head,
                     forward_batch,
+                    aux_hidden_states,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)

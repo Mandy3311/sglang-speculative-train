@@ -20,6 +20,7 @@ from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
+from einops import rearrange
 
 # Configs
 from sglang.srt.configs.qwen3_5 import (
@@ -72,14 +73,7 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 
 # Utils
-from sglang.srt.utils import (
-    LazyValue,
-    add_prefix,
-    is_cuda,
-    is_npu,
-    make_layers,
-    set_weight_attrs,
-)
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weight_attrs
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -193,7 +187,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             torch.ones(self.num_v_heads // self.attn_tp_size),
         )
         self.A_log = nn.Parameter(
-            torch.empty(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
+            torch.empty(self.num_v_heads // self.attn_tp_size),
         )
 
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
@@ -286,7 +280,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
+        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output, _ = self.out_proj(core_attn_out)
         return output
 
@@ -301,7 +295,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -325,7 +318,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
-                is_nextn=is_nextn,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -397,12 +389,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                use_reduce_scatter,
-                should_allreduce_fusion,
-            )
+            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
         else:
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
@@ -427,7 +414,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -530,7 +516,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
-                is_nextn=is_nextn,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -651,12 +636,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                use_reduce_scatter,
-                should_allreduce_fusion,
-            )
+            hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
         else:
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
@@ -685,12 +665,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         config: Qwen3_5TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+
+        # For DFlash / EAGLE3 hidden-state capture
+        self.layers_to_capture = []
 
         alt_stream = torch.cuda.Stream() if _is_cuda else None
 
@@ -719,7 +701,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
-                is_nextn=is_nextn,
             )
 
         self.layers = make_layers(
@@ -781,7 +762,12 @@ class Qwen3_5ForCausalLM(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         # Pass through decoder layers
+        aux_hidden_states = []
         for layer_idx in range(self.start_layer, self.end_layer):
+            if hasattr(self, 'layers_to_capture') and layer_idx in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
             layer = self.layers[layer_idx]
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
@@ -820,7 +806,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -879,14 +868,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-    @classmethod
-    def get_model_config_for_expert_location(cls, config):
-        return ModelConfigForExpertLocation(
-            num_layers=config.num_hidden_layers,
-            num_logical_experts=config.num_experts,
-            num_groups=None,
-        )
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
@@ -1119,6 +1100,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        """DFlash aux hidden capture. SGLang captures before each layer (input =
+        output of prev layer). To get output of layer i, capture before layer i+1."""
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
     def set_embed_and_head(self, embed, head):
         if self.pp_group.is_first_rank and embed is not None:
             del self.model.embed_tokens.weight
@@ -1214,6 +1204,15 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        """DFlash aux hidden capture. SGLang captures before each layer (input =
+        output of prev layer). To get output of layer i, capture before layer i+1."""
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_embed_and_head(self, embed, head):
         if self.pp_group.is_first_rank and embed is not None:
@@ -1415,19 +1414,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
-        self._routed_experts_weights_of_layer = LazyValue(
-            lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
-            }
-        )
-
         return loaded_params
-
-    @property
-    def routed_experts_weights_of_layer(self):
-        return self._routed_experts_weights_of_layer.value
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
