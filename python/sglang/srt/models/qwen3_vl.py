@@ -1428,6 +1428,19 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
 
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # SGLang captures "before layer i". To capture the hidden state after target
+        # layer `k` (HF-style), we capture before layer `k + 1`.
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 EntryClass = Qwen3VLForConditionalGeneration
